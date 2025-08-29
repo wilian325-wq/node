@@ -1,0 +1,285 @@
+const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
+
+class CandlestickRecorderBot {
+    constructor(config = {}) {
+        this.config = {
+            symbol: config.symbol || 'BTCUSDT',
+            exchange: config.exchange || 'binance',
+            interval: '1m',
+            recordDuration: 25000, // 25 segundos em millisegundos
+            maxCandles: config.maxCandles || 50,
+            outputDir: config.outputDir || './candlestick_data',
+            ...config
+        };
+        
+        this.candleData = [];
+        this.currentCandle = null;
+        this.isRecording = false;
+        this.recordingTimer = null;
+        this.ws = null;
+        
+        this.initializeOutputDirectory();
+    }
+
+    initializeOutputDirectory() {
+        if (!fs.existsSync(this.config.outputDir)) {
+            fs.mkdirSync(this.config.outputDir, { recursive: true });
+        }
+    }
+
+    // Conexão WebSocket para Binance
+    connectToBinance() {
+        const wsUrl = `wss://stream.binance.com:9443/ws/${this.config.symbol.toLowerCase()}@kline_${this.config.interval}`;
+        
+        this.ws = new WebSocket(wsUrl);
+        
+        this.ws.on('open', () => {
+            console.log(`🔗 Conectado à Binance WebSocket para ${this.config.symbol}`);
+            this.logEvent('WebSocket conectado');
+        });
+        
+        this.ws.on('message', (data) => {
+            try {
+                const message = JSON.parse(data);
+                if (message.k) {
+                    this.processCandlestick(message.k);
+                }
+            } catch (error) {
+                console.error('❌ Erro ao processar mensagem:', error);
+            }
+        });
+        
+        this.ws.on('error', (error) => {
+            console.error('❌ Erro WebSocket:', error);
+            this.reconnect();
+        });
+        
+        this.ws.on('close', () => {
+            console.log('📡 Conexão WebSocket fechada');
+            this.reconnect();
+        });
+    }
+
+    processCandlestick(kline) {
+        const candlestick = {
+            symbol: kline.s,
+            openTime: new Date(kline.t),
+            closeTime: new Date(kline.T),
+            open: parseFloat(kline.o),
+            high: parseFloat(kline.h),
+            low: parseFloat(kline.l),
+            close: parseFloat(kline.c),
+            volume: parseFloat(kline.v),
+            trades: kline.n,
+            isClosed: kline.x,
+            timestamp: Date.now()
+        };
+
+        // Inicia gravação quando uma nova vela começa
+        if (candlestick.isClosed && !this.isRecording) {
+            this.startRecording(candlestick);
+        }
+        
+        // Atualiza dados da vela atual durante a gravação
+        if (this.isRecording) {
+            this.updateCurrentCandle(candlestick);
+        }
+    }
+
+    startRecording(candlestick) {
+        this.isRecording = true;
+        this.currentCandle = {
+            ...candlestick,
+            movements: [],
+            recordingStart: Date.now()
+        };
+
+        console.log(`🎬 Iniciando gravação da vela: ${candlestick.openTime.toISOString()}`);
+        
+        // Timer para parar gravação após 25 segundos
+        this.recordingTimer = setTimeout(() => {
+            this.stopRecording();
+        }, this.config.recordDuration);
+    }
+
+    updateCurrentCandle(candlestick) {
+        if (!this.currentCandle) return;
+
+        // Registra movimento (mudança de preço)
+        const lastMovement = this.currentCandle.movements[this.currentCandle.movements.length - 1];
+        const currentPrice = candlestick.close;
+        
+        if (!lastMovement || lastMovement.price !== currentPrice) {
+            this.currentCandle.movements.push({
+                timestamp: Date.now(),
+                price: currentPrice,
+                volume: candlestick.volume,
+                high: candlestick.high,
+                low: candlestick.low
+            });
+        }
+
+        // Atualiza dados da vela
+        this.currentCandle.close = candlestick.close;
+        this.currentCandle.high = Math.max(this.currentCandle.high, candlestick.high);
+        this.currentCandle.low = Math.min(this.currentCandle.low, candlestick.low);
+        this.currentCandle.volume = candlestick.volume;
+        this.currentCandle.trades = candlestick.trades;
+    }
+
+    stopRecording() {
+        if (!this.isRecording || !this.currentCandle) return;
+
+        this.isRecording = false;
+        
+        const recordingDuration = Date.now() - this.currentCandle.recordingStart;
+        const movementCount = this.currentCandle.movements.length;
+        
+        console.log(`⏹️  Gravação finalizada: ${movementCount} movimentos em ${recordingDuration}ms`);
+        
+        // Salva apenas velas com mais de 20 movimentos
+        if (movementCount > 20) {
+            this.saveCandleData();
+        } else {
+            console.log(`⚠️  Vela descartada: apenas ${movementCount} movimentos (mínimo: 21)`);
+        }
+        
+        this.currentCandle = null;
+        
+        if (this.recordingTimer) {
+            clearTimeout(this.recordingTimer);
+            this.recordingTimer = null;
+        }
+    }
+
+    saveCandleData() {
+        if (!this.currentCandle) return;
+
+        this.candleData.push({
+            ...this.currentCandle,
+            id: this.candleData.length + 1,
+            recordedAt: new Date().toISOString()
+        });
+
+        // Salva arquivo individual da vela
+        const filename = `candle_${this.currentCandle.openTime.toISOString().replace(/[:.]/g, '-')}.json`;
+        const filepath = path.join(this.config.outputDir, filename);
+        
+        fs.writeFileSync(filepath, JSON.stringify(this.currentCandle, null, 2));
+        
+        // Atualiza arquivo consolidado
+        this.updateConsolidatedFile();
+        
+        console.log(`💾 Vela salva: ${filename} (${this.currentCandle.movements.length} movimentos)`);
+        
+        // Remove velas antigas se exceder o limite
+        if (this.candleData.length > this.config.maxCandles) {
+            this.candleData.shift();
+        }
+    }
+
+    updateConsolidatedFile() {
+        const consolidatedFile = path.join(this.config.outputDir, 'all_candles.json');
+        const summary = {
+            totalCandles: this.candleData.length,
+            symbol: this.config.symbol,
+            interval: this.config.interval,
+            recordDuration: this.config.recordDuration,
+            lastUpdate: new Date().toISOString(),
+            candles: this.candleData.map(candle => ({
+                id: candle.id,
+                openTime: candle.openTime,
+                movements: candle.movements.length,
+                priceRange: {
+                    open: candle.open,
+                    close: candle.close,
+                    high: candle.high,
+                    low: candle.low
+                },
+                volume: candle.volume
+            }))
+        };
+        
+        fs.writeFileSync(consolidatedFile, JSON.stringify(summary, null, 2));
+    }
+
+    getStatistics() {
+        const totalMovements = this.candleData.reduce((sum, candle) => sum + candle.movements.length, 0);
+        const avgMovements = this.candleData.length > 0 ? totalMovements / this.candleData.length : 0;
+        
+        return {
+            totalCandles: this.candleData.length,
+            totalMovements,
+            averageMovementsPerCandle: Math.round(avgMovements * 100) / 100,
+            recording: this.isRecording,
+            currentCandleMovements: this.currentCandle ? this.currentCandle.movements.length : 0
+        };
+    }
+
+    logEvent(message) {
+        const logFile = path.join(this.config.outputDir, 'bot.log');
+        const timestamp = new Date().toISOString();
+        const logEntry = `${timestamp} - ${message}\n`;
+        
+        fs.appendFileSync(logFile, logEntry);
+    }
+
+    reconnect() {
+        setTimeout(() => {
+            console.log('🔄 Tentando reconectar...');
+            this.connectToBinance();
+        }, 5000);
+    }
+
+    start() {
+        console.log(`🚀 Iniciando bot de gravação de candlesticks`);
+        console.log(`📊 Símbolo: ${this.config.symbol}`);
+        console.log(`⏱️  Intervalo: ${this.config.interval}`);
+        console.log(`🎥 Duração de gravação: ${this.config.recordDuration / 1000}s por vela`);
+        console.log(`📁 Diretório de saída: ${this.config.outputDir}`);
+        
+        this.connectToBinance();
+        
+        // Status a cada 30 segundos
+        setInterval(() => {
+            const stats = this.getStatistics();
+            console.log(`📈 Status: ${stats.totalCandles} velas | Gravando: ${stats.recording ? 'SIM' : 'NÃO'} | Movimentos atuais: ${stats.currentCandleMovements}`);
+        }, 30000);
+    }
+
+    stop() {
+        console.log('🛑 Parando bot...');
+        
+        if (this.ws) {
+            this.ws.close();
+        }
+        
+        if (this.recordingTimer) {
+            clearTimeout(this.recordingTimer);
+        }
+        
+        if (this.currentCandle && this.isRecording) {
+            this.stopRecording();
+        }
+        
+        console.log('✅ Bot parado');
+    }
+}
+
+// Exemplo de uso
+const bot = new CandlestickRecorderBot({
+    symbol: 'BTCUSDT',
+    maxCandles: 100,
+    outputDir: './candlestick_recordings'
+});
+
+// Iniciar o bot
+bot.start();
+
+// Parar o bot após um tempo (opcional)
+// setTimeout(() => bot.stop(), 300000); // Para após 5 minutos
+
+// Exportar para uso como módulo
+module.exports = CandlestickRecorderBot;
